@@ -8,9 +8,8 @@
 #include <pthread.h>
 
 /* -------------------------------------------------------- */
-#define do_log(level, format, ...)                          \
-	blog(level, "[NVIDIA Audio Effects: '%s'] " format, \
-	     obs_source_get_name(ng->context), ##__VA_ARGS__)
+#define do_log(level, format, ...) \
+	blog(level, "[NVIDIA Audio Effects: '%s'] " format, obs_source_get_name(ng->context), ##__VA_ARGS__)
 
 #define warn(format, ...) do_log(LOG_WARNING, format, ##__VA_ARGS__)
 #define info(format, ...) do_log(LOG_INFO, format, ##__VA_ARGS__)
@@ -27,15 +26,16 @@
 #define S_METHOD_NVAFX_DENOISER NVAFX_EFFECT_DENOISER
 #define S_METHOD_NVAFX_DEREVERB NVAFX_EFFECT_DEREVERB
 #define S_METHOD_NVAFX_DEREVERB_DENOISER NVAFX_EFFECT_DEREVERB_DENOISER
+#define S_NVAFX_VAD "vad"
 
 #define MT_ obs_module_text
 #define TEXT_NVAFX_INTENSITY MT_("Nvafx.Intensity")
 #define TEXT_METHOD MT_("Nvafx.Method")
 #define TEXT_METHOD_NVAFX_DENOISER MT_("Nvafx.Method.Denoiser")
 #define TEXT_METHOD_NVAFX_DEREVERB MT_("Nvafx.Method.Dereverb")
-#define TEXT_METHOD_NVAFX_DEREVERB_DENOISER \
-	MT_("Nvafx.Method.DenoiserPlusDereverb")
+#define TEXT_METHOD_NVAFX_DEREVERB_DENOISER MT_("Nvafx.Method.DenoiserPlusDereverb")
 #define TEXT_METHOD_NVAFX_DEPRECATION MT_("Nvafx.OutdatedSDK")
+#define TEXT_NVAFX_VAD MT_("Nvafx.VAD")
 
 #define MAX_PREPROC_CHANNELS 8
 #define BUFFER_SIZE_MSEC 10
@@ -48,6 +48,8 @@
 #ifdef _MSC_VER
 #define ssize_t intptr_t
 #endif
+
+bool nvafx_new_sdk = false;
 
 struct nvidia_audio_data {
 	obs_source_t *context;
@@ -113,6 +115,9 @@ struct nvidia_audio_data {
 	/* output data */
 	struct obs_audio_data output_audio;
 	DARRAY(float) output_data;
+
+	/* Optimization for Voice Audio Data (VAD) ; requires SDK >= 0.7.6 */
+	bool vad;
 };
 
 static const char *nvidia_audio_name(void *unused)
@@ -125,17 +130,21 @@ static void nvidia_audio_destroy(void *data)
 {
 	struct nvidia_audio_data *ng = data;
 
+	if (!ng)
+		return;
+
 	if (ng->nvidia_sdk_dir_found)
 		pthread_mutex_lock(&ng->nvafx_mutex);
+
+	if (nvafx_new_sdk)
+		NvAFX_UninitializeLogger();
 
 	for (size_t i = 0; i < ng->channels; i++) {
 		if (ng->handle[0]) {
 			if (NvAFX_DestroyEffect) {
-				NvAFX_Status err =
-					NvAFX_DestroyEffect(ng->handle[i]);
+				NvAFX_Status err = NvAFX_DestroyEffect(ng->handle[i]);
 				if (err != NVAFX_STATUS_SUCCESS) {
-					do_log(LOG_ERROR,
-					       "NvAFX_Release() failed");
+					do_log(LOG_ERROR, "NvAFX_Release() failed");
 				}
 			}
 		}
@@ -213,17 +222,13 @@ bool load_nvidia_afx(void)
 	uint8_t build = (version >> 8) & 0x0000ff;
 	uint8_t revision = (version >> 0) & 0x000000ff;
 	if (version) {
-		blog(LOG_INFO, "[NVIDIA Audio Effects:] version: %i.%i.%i.%i",
-		     major, minor, build, revision);
+		blog(LOG_INFO, "[NVIDIA Audio Effects:] version: %i.%i.%i.%i", major, minor, build, revision);
 		if (version < MIN_AFX_SDK_VERSION) {
 			blog(LOG_INFO,
 			     "[NVIDIA Audio Effects:]: SDK is outdated. Please update both audio & video SDK.\nRequired SDK versions, audio: %i.%i.%i; video: %i.%i.%i",
-			     (MIN_AFX_SDK_VERSION >> 24) & 0xff,
-			     (MIN_AFX_SDK_VERSION >> 16) & 0x00ff,
-			     (MIN_AFX_SDK_VERSION >> 8) & 0x0000ff,
-			     (MIN_VFX_SDK_VERSION >> 24) & 0xff,
-			     (MIN_VFX_SDK_VERSION >> 16) & 0x00ff,
-			     (MIN_VFX_SDK_VERSION >> 8) & 0x0000ff);
+			     (MIN_AFX_SDK_VERSION >> 24) & 0xff, (MIN_AFX_SDK_VERSION >> 16) & 0x00ff,
+			     (MIN_AFX_SDK_VERSION >> 8) & 0x0000ff, (MIN_VFX_SDK_VERSION >> 24) & 0xff,
+			     (MIN_VFX_SDK_VERSION >> 16) & 0x00ff, (MIN_VFX_SDK_VERSION >> 8) & 0x0000ff);
 		}
 	}
 	if (!load_lib()) {
@@ -232,16 +237,22 @@ bool load_nvidia_afx(void)
 		return false;
 	}
 
-	nvidia_afx_initializer_mutex_initialized =
-		pthread_mutex_init(&nvidia_afx_initializer_mutex, NULL) == 0;
+	nvidia_afx_initializer_mutex_initialized = pthread_mutex_init(&nvidia_afx_initializer_mutex, NULL) == 0;
 
-#define LOAD_SYM_FROM_LIB(sym, lib, dll)                                    \
-	if (!(sym = (sym##_t)GetProcAddress(lib, #sym))) {                  \
-		DWORD err = GetLastError();                                 \
-		printf("[noise suppress]: Couldn't load " #sym " from " dll \
-		       ": %lu (0x%lx)",                                     \
-		       err, err);                                           \
-		goto unload_everything;                                     \
+#define LOAD_SYM_FROM_LIB(sym, lib, dll)                                                                       \
+	if (!(sym = (sym##_t)GetProcAddress(lib, #sym))) {                                                     \
+		DWORD err = GetLastError();                                                                    \
+		printf("[NVIDIA Audio Effects:]: Couldn't load " #sym " from " dll ": %lu (0x%lx)", err, err); \
+		goto unload_everything;                                                                        \
+	}
+
+#define LOAD_SYM_FROM_LIB2(sym, lib, dll)                                                                      \
+	if (!(sym = (sym##_t)GetProcAddress(lib, #sym))) {                                                     \
+		DWORD err = GetLastError();                                                                    \
+		printf("[NVIDIA Audio Effects:]: Couldn't load " #sym " from " dll ": %lu (0x%lx)", err, err); \
+		nvafx_new_sdk = false;                                                                         \
+	} else {                                                                                               \
+		nvafx_new_sdk = true;                                                                          \
 	}
 
 #define LOAD_SYM(sym) LOAD_SYM_FROM_LIB(sym, nv_audiofx, "NVAudioEffects.dll")
@@ -270,7 +281,15 @@ bool load_nvidia_afx(void)
 	LOAD_SYM(cuCtxPopCurrent);
 	LOAD_SYM(cuInit);
 #undef LOAD_SYM
-
+#define LOAD_SYM(sym) LOAD_SYM_FROM_LIB2(sym, nv_audiofx, "NVAudioEffects.dll")
+	LOAD_SYM(NvAFX_InitializeLogger);
+	bool new_sdk = nvafx_new_sdk;
+	LOAD_SYM(NvAFX_UninitializeLogger);
+	if (!nvafx_new_sdk || !new_sdk) {
+		blog(LOG_INFO, "[NVIDIA AUDIO FX]: SDK loaded but old redistributable detected. Please upgrade.");
+		nvafx_new_sdk = false;
+	}
+#undef LOAD_SYM
 	NvAFX_Status err;
 	CUresult cudaerr;
 
@@ -301,19 +320,16 @@ bool load_nvidia_afx(void)
 
 	if (err != NVAFX_STATUS_SUCCESS) {
 		if (err == NVAFX_STATUS_GPU_UNSUPPORTED) {
-			blog(LOG_INFO,
-			     "[NVIDIA Audio Effects:] disabled: unsupported GPU");
+			blog(LOG_INFO, "[NVIDIA Audio Effects:] disabled: unsupported GPU");
 		} else {
-			blog(LOG_ERROR,
-			     "[NVIDIA Audio Effects:] disabled, error %i", err);
+			blog(LOG_ERROR, "[NVIDIA Audio Effects:] disabled, error %i", err);
 		}
 		goto unload_everything;
 	}
 
 	err = NvAFX_DestroyEffect(h);
 	if (err != NVAFX_STATUS_SUCCESS) {
-		blog(LOG_ERROR, "[NVIDIA Audio Effects:]: disabled, error %i",
-		     err);
+		blog(LOG_ERROR, "[NVIDIA Audio Effects:]: disabled, error %i", err);
 		goto unload_everything;
 	}
 
@@ -322,8 +338,7 @@ bool load_nvidia_afx(void)
 	return true;
 
 cuda_errors:
-	blog(LOG_ERROR, "[NVIDIA Audio Effects:] disabled, CUDA error %i",
-	     cudaerr);
+	blog(LOG_ERROR, "[NVIDIA Audio Effects:] disabled, CUDA error %i", cudaerr);
 unload_everything:
 	release_afxlib();
 
@@ -359,9 +374,7 @@ static bool nvidia_audio_initialize_internal(void *data)
 			}
 			err = NvAFX_CreateEffect(ng->fx, &ng->handle[i]);
 			if (err != NVAFX_STATUS_SUCCESS) {
-				do_log(LOG_ERROR,
-				       "%s FX creation failed, error %i",
-				       ng->fx, err);
+				do_log(LOG_ERROR, "%s FX creation failed, error %i", ng->fx, err);
 				goto failure;
 			}
 			if (cuCtxGetCurrent(&curr) != CUDA_SUCCESS) {
@@ -371,44 +384,41 @@ static bool nvidia_audio_initialize_internal(void *data)
 				cuCtxPopCurrent(NULL);
 			}
 			// Set sample rate of FX
-			err = NvAFX_SetU32(ng->handle[i],
-					   NVAFX_PARAM_INPUT_SAMPLE_RATE,
-					   ng->sample_rate);
+			err = NvAFX_SetU32(ng->handle[i], NVAFX_PARAM_INPUT_SAMPLE_RATE, ng->sample_rate);
 			if (err != NVAFX_STATUS_SUCCESS) {
-				do_log(LOG_ERROR,
-				       "NvAFX_SetU32(Sample Rate: %u) failed, error %i",
-				       ng->sample_rate, err);
+				do_log(LOG_ERROR, "NvAFX_SetU32(Sample Rate: %u) failed, error %i", ng->sample_rate,
+				       err);
 				goto failure;
 			}
 
 			// Set intensity of FX
-			err = NvAFX_SetFloat(ng->handle[i],
-					     NVAFX_PARAM_INTENSITY_RATIO,
-					     ng->intensity_ratio);
+			err = NvAFX_SetFloat(ng->handle[i], NVAFX_PARAM_INTENSITY_RATIO, ng->intensity_ratio);
 			if (err != NVAFX_STATUS_SUCCESS) {
-				do_log(LOG_ERROR,
-				       "NvAFX_SetFloat(Intensity Ratio: %f) failed, error %i",
+				do_log(LOG_ERROR, "NvAFX_SetFloat(Intensity Ratio: %f) failed, error %i",
 				       ng->intensity_ratio, err);
 				goto failure;
 			}
 
+			// Set VAD (Voice Audio Data)
+			if (nvafx_new_sdk) {
+				err = NvAFX_SetU32(ng->handle[i], NVAFX_PARAM_ENABLE_VAD, ng->vad);
+				if (err != NVAFX_STATUS_SUCCESS) {
+					do_log(LOG_ERROR, "NvAFX_SetU32(VAD: %i) failed, error %i", ng->vad, err);
+					goto failure;
+				}
+			}
+
 			// Set AI models path
-			err = NvAFX_SetString(ng->handle[i],
-					      NVAFX_PARAM_MODEL_PATH,
-					      ng->model);
+			err = NvAFX_SetString(ng->handle[i], NVAFX_PARAM_MODEL_PATH, ng->model);
 			if (err != NVAFX_STATUS_SUCCESS) {
-				do_log(LOG_ERROR,
-				       "NvAFX_SetString() failed, error %i",
-				       err);
+				do_log(LOG_ERROR, "NvAFX_SetString() failed, error %i", err);
 				goto failure;
 			}
 
 			// Load FX (this is a very long step, about 2 seconds)
 			err = NvAFX_Load(ng->handle[i]);
 			if (err != NVAFX_STATUS_SUCCESS) {
-				do_log(LOG_ERROR,
-				       "NvAFX_Load() failed with error %i",
-				       err);
+				do_log(LOG_ERROR, "NvAFX_Load() failed with error %i", err);
 				goto failure;
 			}
 			os_atomic_set_bool(&ng->reinit_done, true);
@@ -419,6 +429,15 @@ static bool nvidia_audio_initialize_internal(void *data)
 failure:
 	ng->use_nvafx = false;
 	return false;
+}
+
+static void *nvidia_audio_disable(void *data)
+{
+	struct nvidia_audio_data *ng = data;
+	obs_source_t *filter = ng->context;
+	obs_source_set_enabled(filter, false);
+	info("NVIDIA Audio FX disabled due to an internal error.");
+	return NULL;
 }
 
 static void *nvidia_audio_initialize(void *data)
@@ -435,26 +454,19 @@ static void *nvidia_audio_initialize(void *data)
 		goto failure;
 	}
 	if (ng->use_nvafx) {
-		err = NvAFX_GetU32(ng->handle[0],
-				   NVAFX_PARAM_NUM_INPUT_CHANNELS,
-				   &ng->num_channels);
+		err = NvAFX_GetU32(ng->handle[0], NVAFX_PARAM_NUM_INPUT_CHANNELS, &ng->num_channels);
 		if (err != NVAFX_STATUS_SUCCESS) {
-			do_log(LOG_ERROR,
-			       "NvAFX_GetU32() failed to get the number of channels, error %i",
-			       err);
+			do_log(LOG_ERROR, "NvAFX_GetU32() failed to get the number of channels, error %i", err);
 			goto failure;
 		}
 		if (ng->num_channels != 1) {
-			do_log(LOG_ERROR,
-			       "The number of channels is not 1 in the sdk any more ==> update code");
+			do_log(LOG_ERROR, "The number of channels is not 1 in the sdk any more ==> update code");
 			goto failure;
 		}
-		NvAFX_Status err = NvAFX_GetU32(
-			ng->handle[0], NVAFX_PARAM_NUM_INPUT_SAMPLES_PER_FRAME,
-			&ng->num_samples_per_frame);
+		NvAFX_Status err = NvAFX_GetU32(ng->handle[0], NVAFX_PARAM_NUM_INPUT_SAMPLES_PER_FRAME,
+						&ng->num_samples_per_frame);
 		if (err != NVAFX_STATUS_SUCCESS) {
-			do_log(LOG_ERROR,
-			       "NvAFX_GetU32() failed to get the number of samples per frame, error %i",
+			do_log(LOG_ERROR, "NvAFX_GetU32() failed to get the number of samples per frame, error %i",
 			       err);
 			goto failure;
 		}
@@ -474,7 +486,7 @@ failure:
 	ng->use_nvafx = false;
 	pthread_mutex_unlock(&nvidia_afx_initializer_mutex);
 	pthread_mutex_unlock(&ng->nvafx_mutex);
-	nvidia_audio_destroy(ng);
+	nvidia_audio_disable(ng);
 	return NULL;
 }
 
@@ -533,39 +545,53 @@ static void nvidia_audio_update(void *data, obs_data_t *s)
 	ng->latency = 1000000000LL / (1000 / BUFFER_SIZE_MSEC);
 
 	float intensity = (float)obs_data_get_double(s, S_NVAFX_INTENSITY);
+	bool vad = obs_data_get_bool(s, S_NVAFX_VAD);
+
 	/*-------------------------------------------------------------------*/
 	/* STAGE 1 : the following is run only when the filter is created. */
 
 	/* If the DLL hasn't been loaded & isn't loading, start the side loading. */
 	if (!ng->nvafx_initialized && !ng->nvafx_loading) {
 		ng->intensity_ratio = intensity;
+		ng->vad = vad;
 		ng->nvafx_loading = true;
-		pthread_create(&ng->nvafx_thread, NULL, nvidia_audio_initialize,
-			       ng);
+		pthread_create(&ng->nvafx_thread, NULL, nvidia_audio_initialize, ng);
 	}
 
 	/*-------------------------------------------------------------------*/
 	/* STAGE 2 : this is executed only after the FX has been initialized */
 	if (ng->nvafx_initialized) {
 		/* updating the intensity of the FX */
-		if (intensity != ng->intensity_ratio &&
-		    (strcmp(ng->fx, method) == 0)) {
+		if (intensity != ng->intensity_ratio && (strcmp(ng->fx, method) == 0)) {
 			NvAFX_Status err;
 			ng->intensity_ratio = intensity;
 			pthread_mutex_lock(&ng->nvafx_mutex);
 			for (size_t i = 0; i < ng->channels; i++) {
-				err = NvAFX_SetFloat(
-					ng->handle[i],
-					NVAFX_PARAM_INTENSITY_RATIO,
-					ng->intensity_ratio);
+				err = NvAFX_SetFloat(ng->handle[i], NVAFX_PARAM_INTENSITY_RATIO, ng->intensity_ratio);
 				if (err != NVAFX_STATUS_SUCCESS) {
-					do_log(LOG_ERROR,
-					       "NvAFX_SetFloat(Intensity Ratio: %f) failed, error %i",
+					do_log(LOG_ERROR, "NvAFX_SetFloat(Intensity Ratio: %f) failed, error %i",
 					       ng->intensity_ratio, err);
-					nvidia_audio_destroy(ng);
+					nvidia_audio_disable(ng);
 				}
 			}
 			pthread_mutex_unlock(&ng->nvafx_mutex);
+		}
+		/* updating for VAD toggled on or off */
+		if (nvafx_new_sdk) {
+			if (vad != ng->vad && (strcmp(ng->fx, method) == 0)) {
+				NvAFX_Status err;
+				ng->vad = vad;
+				pthread_mutex_lock(&ng->nvafx_mutex);
+				for (size_t i = 0; i < ng->channels; i++) {
+					err = NvAFX_SetU32(ng->handle[i], NVAFX_PARAM_ENABLE_VAD, ng->vad);
+					if (err != NVAFX_STATUS_SUCCESS) {
+						do_log(LOG_ERROR, "NvAFX_SetU32(VAD: %i) failed, error %i", ng->vad,
+						       err);
+						nvidia_audio_disable(ng);
+					}
+				}
+				pthread_mutex_unlock(&ng->nvafx_mutex);
+			}
 		}
 		/* swapping to a new FX requires a reinitialization */
 		if ((strcmp(ng->fx, method) != 0)) {
@@ -573,31 +599,35 @@ static void nvidia_audio_update(void *data, obs_data_t *s)
 			bfree((void *)ng->fx);
 			ng->fx = bstrdup(method);
 			ng->intensity_ratio = intensity;
+			ng->vad = vad;
 			set_nv_model(ng, method);
 			os_atomic_set_bool(&ng->reinit_done, false);
 			for (int i = 0; i < (int)ng->channels; i++) {
 				/* Destroy previous FX */
-				if (NvAFX_DestroyEffect(ng->handle[i]) !=
-				    NVAFX_STATUS_SUCCESS) {
-					do_log(LOG_ERROR,
-					       "FX failed to be destroyed.");
-					nvidia_audio_destroy(ng);
+				if (NvAFX_DestroyEffect(ng->handle[i]) != NVAFX_STATUS_SUCCESS) {
+					do_log(LOG_ERROR, "FX failed to be destroyed.");
+					nvidia_audio_disable(ng);
 				} else {
 					ng->handle[i] = NULL;
 				}
 			}
 			if (!nvidia_audio_initialize_internal(data))
-				nvidia_audio_destroy(ng);
+				nvidia_audio_disable(ng);
 
 			pthread_mutex_unlock(&ng->nvafx_mutex);
 		}
 	}
 }
 
+static void nvafx_logger_callback(void *data, const char *msg)
+{
+	UNUSED_PARAMETER(data);
+	blog(LOG_ERROR, "[NVIDIA Audio Effects: Error - '%s'] ", msg);
+}
+
 static void *nvidia_audio_create(obs_data_t *settings, obs_source_t *filter)
 {
-	struct nvidia_audio_data *ng =
-		bzalloc(sizeof(struct nvidia_audio_data));
+	struct nvidia_audio_data *ng = bzalloc(sizeof(struct nvidia_audio_data));
 
 	ng->context = filter;
 
@@ -638,12 +668,10 @@ static void *nvidia_audio_create(obs_data_t *settings, obs_source_t *filter)
 
 	/* allocate buffers */
 	ng->copy_buffers[0] = bmalloc(frames * channels * sizeof(float));
-	ng->nvafx_segment_buffers[0] =
-		bmalloc(NVAFX_FRAME_SIZE * channels * sizeof(float));
+	ng->nvafx_segment_buffers[0] = bmalloc(NVAFX_FRAME_SIZE * channels * sizeof(float));
 	for (size_t c = 1; c < channels; ++c) {
 		ng->copy_buffers[c] = ng->copy_buffers[c - 1] + frames;
-		ng->nvafx_segment_buffers[c] =
-			ng->nvafx_segment_buffers[c - 1] + NVAFX_FRAME_SIZE;
+		ng->nvafx_segment_buffers[c] = ng->nvafx_segment_buffers[c - 1] + NVAFX_FRAME_SIZE;
 	}
 
 	/* reserve circular buffers */
@@ -670,7 +698,20 @@ static void *nvidia_audio_create(obs_data_t *settings, obs_source_t *filter)
 		ng->nvafx_resampler_back = audio_resampler_create(&src, &dst);
 	}
 
+	/* VAD */
+	ng->vad = 1;
+
 	nvidia_audio_update(ng, settings);
+
+	/* Setup NVIDIA logger */
+	if (nvafx_new_sdk) {
+		NvAFX_Status err = NvAFX_InitializeLogger(NVAFX_LOG_LEVEL_ERROR, LOG_TARGET_CALLBACK, NULL,
+							  &nvafx_logger_callback, ng);
+		if (err != NVAFX_STATUS_SUCCESS) {
+			warn("NvAFX logger failed to initialize.");
+		}
+	}
+
 	return ng;
 }
 
@@ -681,19 +722,14 @@ static inline void process_fx(struct nvidia_audio_data *ng)
 		float *output[MAX_PREPROC_CHANNELS];
 		uint32_t out_frames;
 		uint64_t ts_offset;
-		audio_resampler_resample(ng->nvafx_resampler,
-					 (uint8_t **)output, &out_frames,
-					 &ts_offset,
-					 (const uint8_t **)ng->copy_buffers,
-					 (uint32_t)ng->frames);
+		audio_resampler_resample(ng->nvafx_resampler, (uint8_t **)output, &out_frames, &ts_offset,
+					 (const uint8_t **)ng->copy_buffers, (uint32_t)ng->frames);
 
 		for (size_t i = 0; i < ng->channels; i++) {
-			for (ssize_t j = 0,
-				     k = (ssize_t)out_frames - NVAFX_FRAME_SIZE;
-			     j < NVAFX_FRAME_SIZE; ++j, ++k) {
+			for (ssize_t j = 0, k = (ssize_t)out_frames - NVAFX_FRAME_SIZE; j < NVAFX_FRAME_SIZE;
+			     ++j, ++k) {
 				if (k >= 0) {
-					ng->nvafx_segment_buffers[i][j] =
-						output[i][k];
+					ng->nvafx_segment_buffers[i][j] = output[i][k];
 				} else {
 					ng->nvafx_segment_buffers[i][j] = 0;
 				}
@@ -702,8 +738,7 @@ static inline void process_fx(struct nvidia_audio_data *ng)
 	} else {
 		for (size_t i = 0; i < ng->channels; i++) {
 			for (size_t j = 0; j < NVAFX_FRAME_SIZE; ++j) {
-				ng->nvafx_segment_buffers[i][j] =
-					ng->copy_buffers[i][j];
+				ng->nvafx_segment_buffers[i][j] = ng->copy_buffers[i][j];
 			}
 		}
 	}
@@ -713,47 +748,36 @@ static inline void process_fx(struct nvidia_audio_data *ng)
 	if (ng->reinit_done) {
 		pthread_mutex_lock(&ng->nvafx_mutex);
 		for (size_t i = 0; i < runs; i++) {
-			NvAFX_Status err = NvAFX_Run(
-				ng->handle[i], &ng->nvafx_segment_buffers[i],
-				&ng->nvafx_segment_buffers[i],
-				ng->num_samples_per_frame, ng->num_channels);
+			NvAFX_Status err = NvAFX_Run(ng->handle[i], &ng->nvafx_segment_buffers[i],
+						     &ng->nvafx_segment_buffers[i], ng->num_samples_per_frame,
+						     ng->num_channels);
 			if (err != NVAFX_STATUS_SUCCESS) {
 				if (err == NVAFX_STATUS_FAILED) {
 					do_log(LOG_DEBUG,
 					       "NvAFX_Run() failed, error NVAFX_STATUS_FAILED.\n"
 					       "This can occur when changing the FX and is not consequential.");
 					// stop all processing; this will be reset at new init
-					os_atomic_set_bool(&ng->reinit_done,
-							   false);
+					os_atomic_set_bool(&ng->reinit_done, false);
 				} else {
-					do_log(LOG_ERROR,
-					       "NvAFX_Run() failed, error %i.\n",
-					       err);
+					do_log(LOG_ERROR, "NvAFX_Run() failed, error %i.\n", err);
 				}
 			}
 		}
 		pthread_mutex_unlock(&ng->nvafx_mutex);
 	}
 	if (ng->has_mono_src) {
-		memcpy(ng->nvafx_segment_buffers[1],
-		       ng->nvafx_segment_buffers[0],
-		       NVAFX_FRAME_SIZE * sizeof(float));
+		memcpy(ng->nvafx_segment_buffers[1], ng->nvafx_segment_buffers[0], NVAFX_FRAME_SIZE * sizeof(float));
 	}
 	/* Revert signal level adjustment, resample back if necessary */
 	if (ng->nvafx_resampler) {
 		float *output[MAX_PREPROC_CHANNELS];
 		uint32_t out_frames;
 		uint64_t ts_offset;
-		audio_resampler_resample(
-			ng->nvafx_resampler_back, (uint8_t **)output,
-			&out_frames, &ts_offset,
-			(const uint8_t **)ng->nvafx_segment_buffers,
-			NVAFX_FRAME_SIZE);
+		audio_resampler_resample(ng->nvafx_resampler_back, (uint8_t **)output, &out_frames, &ts_offset,
+					 (const uint8_t **)ng->nvafx_segment_buffers, NVAFX_FRAME_SIZE);
 
 		for (size_t i = 0; i < ng->channels; i++) {
-			for (ssize_t j = 0,
-				     k = (ssize_t)out_frames - ng->frames;
-			     j < (ssize_t)ng->frames; ++j, ++k) {
+			for (ssize_t j = 0, k = (ssize_t)out_frames - ng->frames; j < (ssize_t)ng->frames; ++j, ++k) {
 				if (k >= 0) {
 					ng->copy_buffers[i][j] = output[i][k];
 				} else {
@@ -764,8 +788,7 @@ static inline void process_fx(struct nvidia_audio_data *ng)
 	} else {
 		for (size_t i = 0; i < ng->channels; i++) {
 			for (size_t j = 0; j < NVAFX_FRAME_SIZE; ++j) {
-				ng->copy_buffers[i][j] =
-					ng->nvafx_segment_buffers[i][j];
+				ng->copy_buffers[i][j] = ng->nvafx_segment_buffers[i][j];
 			}
 		}
 	}
@@ -775,8 +798,7 @@ static inline void process(struct nvidia_audio_data *ng)
 {
 	/* Pop from input deque */
 	for (size_t i = 0; i < ng->channels; i++)
-		deque_pop_front(&ng->input_buffers[i], ng->copy_buffers[i],
-				ng->frames * sizeof(float));
+		deque_pop_front(&ng->input_buffers[i], ng->copy_buffers[i], ng->frames * sizeof(float));
 
 	if (ng->use_nvafx && nvidia_afx_loaded && ng->nvafx_initialized) {
 		process_fx(ng);
@@ -784,8 +806,7 @@ static inline void process(struct nvidia_audio_data *ng)
 
 	/* Push to output deque */
 	for (size_t i = 0; i < ng->channels; i++)
-		deque_push_back(&ng->output_buffers[i], ng->copy_buffers[i],
-				ng->frames * sizeof(float));
+		deque_push_back(&ng->output_buffers[i], ng->copy_buffers[i], ng->frames * sizeof(float));
 }
 
 struct nv_audio_info {
@@ -808,8 +829,7 @@ static void reset_data(struct nvidia_audio_data *ng)
 	clear_deque(&ng->info_buffer);
 }
 
-static struct obs_audio_data *
-nvidia_audio_filter_audio(void *data, struct obs_audio_data *audio)
+static struct obs_audio_data *nvidia_audio_filter_audio(void *data, struct obs_audio_data *audio)
 {
 	struct nvidia_audio_data *ng = data;
 	struct nv_audio_info info;
@@ -826,8 +846,7 @@ nvidia_audio_filter_audio(void *data, struct obs_audio_data *audio)
 	 * audio data. Clear all circular buffers to prevent old audio data
 	 * from being processed as part of the new data. */
 	if (ng->last_timestamp) {
-		int64_t diff = llabs((int64_t)ng->last_timestamp -
-				     (int64_t)audio->timestamp);
+		int64_t diff = llabs((int64_t)ng->last_timestamp - (int64_t)audio->timestamp);
 
 		if (diff > 1000000000LL)
 			reset_data(ng);
@@ -844,8 +863,7 @@ nvidia_audio_filter_audio(void *data, struct obs_audio_data *audio)
 	/* -----------------------------------------------
 	 * push back current audio data to input deque */
 	for (size_t i = 0; i < ng->channels; i++)
-		deque_push_back(&ng->input_buffers[i], audio->data[i],
-				audio->frames * sizeof(float));
+		deque_push_back(&ng->input_buffers[i], audio->data[i], audio->frames * sizeof(float));
 
 	/* -----------------------------------------------
 	 * pop/process each 10ms segments, push back to output deque */
@@ -869,11 +887,9 @@ nvidia_audio_filter_audio(void *data, struct obs_audio_data *audio)
 	da_resize(ng->output_data, out_size * ng->channels);
 
 	for (size_t i = 0; i < ng->channels; i++) {
-		ng->output_audio.data[i] =
-			(uint8_t *)&ng->output_data.array[i * out_size];
+		ng->output_audio.data[i] = (uint8_t *)&ng->output_data.array[i * out_size];
 
-		deque_pop_front(&ng->output_buffers[i],
-				ng->output_audio.data[i], out_size);
+		deque_pop_front(&ng->output_buffers[i], ng->output_audio.data[i], out_size);
 	}
 
 	ng->output_audio.frames = info.frames;
@@ -885,35 +901,32 @@ static void nvidia_audio_defaults(obs_data_t *s)
 {
 	obs_data_set_default_double(s, S_NVAFX_INTENSITY, 1.0);
 	obs_data_set_default_string(s, S_METHOD, S_METHOD_NVAFX_DENOISER);
+	if (nvafx_new_sdk)
+		obs_data_set_default_bool(s, S_NVAFX_VAD, 1);
 }
 
 static obs_properties_t *nvidia_audio_properties(void *data)
 {
 	obs_properties_t *ppts = obs_properties_create();
 	struct nvidia_audio_data *ng = (struct nvidia_audio_data *)data;
-	obs_property_t *method = obs_properties_add_list(
-		ppts, S_METHOD, TEXT_METHOD, OBS_COMBO_TYPE_LIST,
-		OBS_COMBO_FORMAT_STRING);
+	obs_property_t *method =
+		obs_properties_add_list(ppts, S_METHOD, TEXT_METHOD, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	if (ng->nvidia_sdk_dir_found) {
-		obs_property_list_add_string(method, TEXT_METHOD_NVAFX_DENOISER,
-					     S_METHOD_NVAFX_DENOISER);
-		obs_property_list_add_string(method, TEXT_METHOD_NVAFX_DEREVERB,
-					     S_METHOD_NVAFX_DEREVERB);
-		obs_property_list_add_string(
-			method, TEXT_METHOD_NVAFX_DEREVERB_DENOISER,
-			S_METHOD_NVAFX_DEREVERB_DENOISER);
-		obs_property_t *slider = obs_properties_add_float_slider(
-			ppts, S_NVAFX_INTENSITY, TEXT_NVAFX_INTENSITY, 0.0f,
-			1.0f, 0.01f);
+		obs_property_list_add_string(method, TEXT_METHOD_NVAFX_DENOISER, S_METHOD_NVAFX_DENOISER);
+		obs_property_list_add_string(method, TEXT_METHOD_NVAFX_DEREVERB, S_METHOD_NVAFX_DEREVERB);
+		obs_property_list_add_string(method, TEXT_METHOD_NVAFX_DEREVERB_DENOISER,
+					     S_METHOD_NVAFX_DEREVERB_DENOISER);
+		obs_property_t *slider = obs_properties_add_float_slider(ppts, S_NVAFX_INTENSITY, TEXT_NVAFX_INTENSITY,
+									 0.0f, 1.0f, 0.01f);
+		obs_property_t *vad = obs_properties_add_bool(ppts, S_NVAFX_VAD, TEXT_NVAFX_VAD);
+		if (!nvafx_new_sdk)
+			obs_property_set_visible(vad, 0);
 
 		unsigned int version = get_lib_version();
-		obs_property_t *warning = obs_properties_add_text(
-			ppts, "deprecation", NULL, OBS_TEXT_INFO);
+		obs_property_t *warning = obs_properties_add_text(ppts, "deprecation", NULL, OBS_TEXT_INFO);
 		if (version && version < MIN_AFX_SDK_VERSION) {
-			obs_property_text_set_info_type(warning,
-							OBS_TEXT_INFO_WARNING);
-			obs_property_set_long_description(
-				warning, TEXT_METHOD_NVAFX_DEPRECATION);
+			obs_property_text_set_info_type(warning, OBS_TEXT_INFO_WARNING);
+			obs_property_set_long_description(warning, TEXT_METHOD_NVAFX_DEPRECATION);
 		} else {
 			obs_property_set_visible(warning, 0);
 		}

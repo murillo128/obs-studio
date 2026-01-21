@@ -113,29 +113,28 @@ MODULE_EXPORT void obs_module_set_locale(const char *locale);
 MODULE_EXPORT void obs_module_free_locale(void);
 
 /** Optional: Use this macro in a module to use default locale handling. */
-#define OBS_MODULE_USE_DEFAULT_LOCALE(module_name, default_locale)      \
-	lookup_t *obs_module_lookup = NULL;                             \
-	const char *obs_module_text(const char *val)                    \
-	{                                                               \
-		const char *out = val;                                  \
-		text_lookup_getstr(obs_module_lookup, val, &out);       \
-		return out;                                             \
-	}                                                               \
-	bool obs_module_get_string(const char *val, const char **out)   \
-	{                                                               \
-		return text_lookup_getstr(obs_module_lookup, val, out); \
-	}                                                               \
-	void obs_module_set_locale(const char *locale)                  \
-	{                                                               \
-		if (obs_module_lookup)                                  \
-			text_lookup_destroy(obs_module_lookup);         \
-		obs_module_lookup = obs_module_load_locale(             \
-			obs_current_module(), default_locale, locale);  \
-	}                                                               \
-	void obs_module_free_locale(void)                               \
-	{                                                               \
-		text_lookup_destroy(obs_module_lookup);                 \
-		obs_module_lookup = NULL;                               \
+#define OBS_MODULE_USE_DEFAULT_LOCALE(module_name, default_locale)                                        \
+	lookup_t *obs_module_lookup = NULL;                                                               \
+	const char *obs_module_text(const char *val)                                                      \
+	{                                                                                                 \
+		const char *out = val;                                                                    \
+		text_lookup_getstr(obs_module_lookup, val, &out);                                         \
+		return out;                                                                               \
+	}                                                                                                 \
+	bool obs_module_get_string(const char *val, const char **out)                                     \
+	{                                                                                                 \
+		return text_lookup_getstr(obs_module_lookup, val, out);                                   \
+	}                                                                                                 \
+	void obs_module_set_locale(const char *locale)                                                    \
+	{                                                                                                 \
+		if (obs_module_lookup)                                                                    \
+			text_lookup_destroy(obs_module_lookup);                                           \
+		obs_module_lookup = obs_module_load_locale(obs_current_module(), default_locale, locale); \
+	}                                                                                                 \
+	void obs_module_free_locale(void)                                                                 \
+	{                                                                                                 \
+		text_lookup_destroy(obs_module_lookup);                                                   \
+		obs_module_lookup = NULL;                                                                 \
 	}
 
 /** Helper function for looking up locale if default locale handler was used */
@@ -143,8 +142,7 @@ MODULE_EXTERN const char *obs_module_text(const char *lookup_string);
 
 /** Helper function for looking up locale if default locale handler was used,
  * returns true if text found, otherwise false */
-MODULE_EXPORT bool obs_module_get_string(const char *lookup_string,
-					 const char **translated_string);
+MODULE_EXPORT bool obs_module_get_string(const char *lookup_string, const char **translated_string);
 
 /** Helper function that returns the current module */
 MODULE_EXTERN obs_module_t *obs_current_module(void);
@@ -162,8 +160,7 @@ MODULE_EXTERN obs_module_t *obs_current_module(void);
  * directory is not set.  Equivalent to:
  *    obs_module_get_config_path(obs_current_module(), file);
  */
-#define obs_module_config_path(file) \
-	obs_module_get_config_path(obs_current_module(), file)
+#define obs_module_config_path(file) obs_module_get_config_path(obs_current_module(), file)
 
 /**
  * Optional: Declares the author(s) of the module
@@ -182,3 +179,9 @@ MODULE_EXPORT const char *obs_module_name(void);
 
 /** Optional: Returns a description of the module */
 MODULE_EXPORT const char *obs_module_description(void);
+
+/** Returns the module's unique ID, or NULL if it doesn't have one */
+MODULE_EXPORT const char *obs_get_module_id(obs_module_t *module);
+
+/** Returns the module's semver version number or NULL if it doesn't have one */
+MODULE_EXPORT const char *obs_get_module_version(obs_module_t *module);
